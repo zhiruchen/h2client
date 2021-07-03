@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -18,18 +19,37 @@ var (
 	clientPreface = []byte(http2.ClientPreface)
 )
 
+const (
+	initialHeaderTableSize = 4096
+)
+
 type ClientConn struct {
 	conn *tls.Conn
 	bw   *bufio.Writer
 	br   *bufio.Reader
 	fr   *http2.Framer
 
-	werr error // first write error  occured
+	readDone  chan struct{} // close on error
+	readerErr error         // set after readDone is closed
+	werr      error         // first write error  occured
 
 	hbuf bytes.Buffer
 	henc *hpack.Encoder
+	hdec *hpack.Decoder
+
+	respHeaders http.Header
 
 	maxFrameSize uint32
+	mu           sync.Mutex
+	streams      map[uint32]*clientStream
+	nextStreamID uint32
+}
+
+type clientStream struct {
+	ID   uint32
+	resc chan *http.Response
+	pw   *io.PipeWriter
+	pr   *io.PipeReader
 }
 
 type stickyErrWriter struct {
@@ -91,7 +111,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	cc := &ClientConn{
-		conn: tlsConn,
+		conn:         tlsConn,
+		readDone:     make(chan struct{}),
+		streams:      make(map[uint32]*clientStream),
+		nextStreamID: 1,
 	}
 	cc.bw = bufio.NewWriter(stickyErrWriter{tlsConn, &cc.werr})
 	cc.br = bufio.NewReader(cc.conn)
@@ -114,6 +137,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !ok {
 		return nil, fmt.Errorf("expect a settings frame")
 	}
+	cc.fr.WriteSettingsAck()
+	cc.bw.Flush()
 
 	//Todo:
 	/*
@@ -132,9 +157,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil
 	})
 
-	// go cc.readLoop()
+	cc.hdec = hpack.NewDecoder(initialHeaderTableSize, cc.onNewHeaderField)
 
-	streamID := cc.nextStreamID()
+	go cc.readLoop()
+
+	cs := cc.newStream()
 	hasBody := false
 
 	// Send Headers[+CONTINUATION] + (DATA?)
@@ -149,14 +176,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		hdrsInBytes = hdrsInBytes[len(chunk):]
 		if firstHeader {
 			cc.fr.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      streamID,
+				StreamID:      cs.ID,
 				BlockFragment: chunk,
 				EndHeaders:    len(hdrsInBytes) == 0,
 				EndStream:     !hasBody,
 			})
 			firstHeader = false
 		} else {
-			cc.fr.WriteContinuation(streamID, len(hdrsInBytes) == 0, chunk)
+			cc.fr.WriteContinuation(cs.ID, len(hdrsInBytes) == 0, chunk)
 		}
 	}
 
@@ -164,34 +191,90 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if cc.werr != nil {
 		return nil, cc.werr
 	}
-	// Server sends: HEADERS[+CONTINUATION]
-	f, err = cc.fr.ReadFrame()
-	if err != nil {
-		return nil, err
-	}
-	fmt.Printf("Get frame after write headers: %v\n", f)
 
-	return &http.Response{}, nil
+	resp := <-cs.resc
+	return resp, nil
+}
+
+func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
+	fmt.Println("Header Field: ", hf)
+	cc.respHeaders.Add(http.CanonicalHeaderKey(hf.Name), hf.Value)
 }
 
 func (cc *ClientConn) readLoop() {
+	defer close(cc.readDone)
 	for {
+		f, err := cc.fr.ReadFrame()
+		if err != nil {
+			fmt.Println("readFrame error: ", err)
+			cc.readerErr = err
+			return
+		}
 
+		fmt.Printf("Read %v: %v\n", f.Header(), f)
+		cs := cc.getStreamByID(f.Header().StreamID)
+
+		headerEnd := false
+		streamEnd := false
+
+		switch f := f.(type) {
+		case *http2.HeadersFrame:
+			cc.respHeaders = make(http.Header)
+			cs.pr, cs.pw = io.Pipe()
+
+			cc.hdec.Write(f.HeaderBlockFragment())
+			headerEnd = f.HeadersEnded()
+			streamEnd = f.StreamEnded()
+
+		case *http2.ContinuationFrame:
+			cc.hdec.Write(f.HeaderBlockFragment())
+			headerEnd = f.HeadersEnded()
+			streamEnd = f.Header().Flags.Has(http2.FlagHeadersEndStream)
+
+		case *http2.DataFrame:
+			fmt.Printf("data: %v\n", f.Data())
+			if cs != nil {
+				cs.pw.Write(f.Data())
+			}
+		}
+
+		if streamEnd {
+			cs.pw.Close()
+		}
+
+		if headerEnd {
+			if cs == nil {
+				panic("stream not found")
+			}
+
+			cs.resc <- &http.Response{
+				Header: cc.respHeaders,
+				Body:   cs.pr,
+			}
+		}
 	}
 }
 
 func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
 	cc.hbuf.Reset()
+	var host = req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
 
 	cc.writeHeader(":method", req.Method)
 	cc.writeHeader(":scheme", "https")
-	// cc.writeHeader(":authority", req.Host)
+	cc.writeHeader(":authority", host)
 	cc.writeHeader(":path", req.URL.Path)
 
 	for k, vs := range req.Header {
 		for _, v := range vs {
 			cc.writeHeader(strings.ToLower(k), v)
 		}
+	}
+
+	if _, ok := req.Header[http.CanonicalHeaderKey("Host")]; !ok {
+		cc.writeHeader("host", host)
 	}
 
 	return cc.hbuf.Bytes()
@@ -201,6 +284,21 @@ func (cc *ClientConn) writeHeader(name, value string) {
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }
 
-func (cc *ClientConn) nextStreamID() uint32 {
-	return 1
+func (cc *ClientConn) newStream() *clientStream {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	cs := &clientStream{
+		ID:   cc.nextStreamID,
+		resc: make(chan *http.Response, 1),
+	}
+	cc.streams[cs.ID] = cs
+	cc.nextStreamID += 2
+	return cs
+}
+
+func (cc *ClientConn) getStreamByID(id uint32) *clientStream {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.streams[id]
 }
