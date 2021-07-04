@@ -24,6 +24,10 @@ const (
 )
 
 type ClientConn struct {
+	t        *Transport
+	tconn    net.Conn
+	tlsState *tls.ConnectionState
+
 	conn *tls.Conn
 	bw   *bufio.Writer
 	br   *bufio.Reader
@@ -39,7 +43,11 @@ type ClientConn struct {
 
 	respHeaders http.Header
 
-	maxFrameSize uint32
+	maxFrameSize          uint32
+	initialWindowSize     uint32
+	maxConcurrentStreams  uint32
+	peerMaxHeaderListSize uint64
+
 	mu           sync.Mutex
 	streams      map[uint32]*clientStream
 	nextStreamID uint32
@@ -68,63 +76,30 @@ func (se stickyErrWriter) Write(p []byte) (int, error) {
 }
 
 type Transport struct {
-	Fallback http.RoundTripper
+	TLSClientConfig *tls.Config
+	ConnPool        ClientConnPool
+
+	// How many bytes of the response headers are allowed
+	MaxHeaderListSize uint32
+	t1                http.RoundTripper
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme != "https" {
-		if t.Fallback == nil {
+		if t.t1 == nil {
 			return nil, fmt.Errorf("http2: unsupported scheme and no Fallback")
 		}
-		return t.Fallback.RoundTrip(req)
+		return t.t1.RoundTrip(req)
 	}
 
-	host, port, err := net.SplitHostPort(req.URL.Host)
-	if err != nil {
-		host = req.URL.Host
-		port = "443"
+	if t.ConnPool == nil {
+		t.ConnPool = &clientConnPool{}
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName: host,
-		NextProtos: []string{http2.NextProtoTLS},
-	}
-	tlsConn, err := tls.Dial("tcp", fmt.Sprintf("%s:%s", host, port), tlsConfig)
+	addr := authorityAddr(req.URL.Scheme, req.URL.Host)
+	cc, err := t.ConnPool.GetClientConn(req, addr)
 	if err != nil {
 		return nil, err
-	}
-
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
-	}
-	if err := tlsConn.VerifyHostname(tlsConfig.ServerName); err != nil {
-		return nil, err
-	}
-
-	state := tlsConn.ConnectionState()
-	fmt.Printf("conn state: %+v\n", state)
-	if p := state.NegotiatedProtocol; p != http2.NextProtoTLS {
-		return nil, fmt.Errorf("bad protocol: %v", p)
-	}
-	if _, err = tlsConn.Write(clientPreface); err != nil {
-		return nil, err
-	}
-
-	cc := &ClientConn{
-		conn:         tlsConn,
-		readDone:     make(chan struct{}),
-		streams:      make(map[uint32]*clientStream),
-		nextStreamID: 1,
-	}
-	cc.bw = bufio.NewWriter(stickyErrWriter{tlsConn, &cc.werr})
-	cc.br = bufio.NewReader(cc.conn)
-	cc.henc = hpack.NewEncoder(&cc.hbuf)
-	cc.fr = http2.NewFramer(cc.bw, cc.br)
-
-	cc.fr.WriteSettings()
-	cc.bw.Flush()
-	if cc.werr != nil {
-		return nil, cc.werr
 	}
 
 	f, err := cc.fr.ReadFrame()
@@ -194,6 +169,90 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	resp := <-cs.resc
 	return resp, nil
+}
+
+func authorityAddr(scheme string, authority string) (addr string) {
+	host, port, err := net.SplitHostPort(authority)
+	if err != nil {
+		port = "443"
+		if scheme == "http" {
+			port = "80"
+		}
+
+		host = authority
+	}
+
+	return net.JoinHostPort(host, port)
+}
+
+func (t *Transport) dialClientConn(addr string) (*ClientConn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig := &tls.Config{
+		ServerName: host,
+		NextProtos: []string{http2.NextProtoTLS},
+	}
+	tlsConn, err := tls.Dial("tcp", addr, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, err
+	}
+	if err := tlsConn.VerifyHostname(tlsConfig.ServerName); err != nil {
+		return nil, err
+	}
+
+	state := tlsConn.ConnectionState()
+	fmt.Printf("conn state: %+v\n", state)
+	if p := state.NegotiatedProtocol; p != http2.NextProtoTLS {
+		return nil, fmt.Errorf("bad protocol: %v", p)
+	}
+
+	return t.newClientConn(tlsConn)
+}
+
+func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
+	cc := &ClientConn{
+		t:                     t,
+		tconn:                 conn,
+		nextStreamID:          1,
+		maxFrameSize:          16 << 10,
+		initialWindowSize:     65535,
+		maxConcurrentStreams:  1000,
+		peerMaxHeaderListSize: 0xffffffffffffffff,
+		readDone:              make(chan struct{}),
+		streams:               make(map[uint32]*clientStream),
+	}
+
+	cc.bw = bufio.NewWriter(stickyErrWriter{conn, &cc.werr})
+	cc.br = bufio.NewReader(cc.conn)
+	cc.fr = http2.NewFramer(cc.bw, cc.br)
+	cc.fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+	cc.fr.MaxHeaderListSize = t.MaxHeaderListSize
+
+	cc.henc = hpack.NewEncoder(&cc.hbuf)
+
+	initialSettings := []http2.Setting{
+		{ID: http2.SettingEnablePush, Val: 0},
+		{ID: http2.SettingInitialWindowSize, Val: 4 << 20},
+		{ID: http2.SettingMaxHeaderListSize, Val: t.MaxHeaderListSize},
+	}
+
+	cc.bw.Write(clientPreface)
+	cc.fr.WriteSettings(initialSettings...)
+	cc.fr.WriteWindowUpdate(0, 1<<30)
+	cc.bw.Flush()
+	if cc.werr != nil {
+		return nil, cc.werr
+	}
+
+	go cc.readLoop()
+	return cc, nil
 }
 
 func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
