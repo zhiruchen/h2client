@@ -53,11 +53,23 @@ type ClientConn struct {
 	nextStreamID uint32
 }
 
+type h2Resp struct {
+	res *http.Response
+	err error
+}
+
 type clientStream struct {
-	ID   uint32
-	resc chan *http.Response
-	pw   *io.PipeWriter
-	pr   *io.PipeReader
+	cc  *ClientConn
+	req *http.Request
+
+	ID      uint32
+	resc    chan h2Resp
+	bufPipe pipe
+
+	done chan struct{}
+
+	pw *io.PipeWriter
+	pr *io.PipeReader
 }
 
 type stickyErrWriter struct {
@@ -102,38 +114,6 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	cs := cc.newStream()
-	hasBody := false
-
-	// Send Headers[+CONTINUATION] + (DATA?)
-	hdrsInBytes := cc.encodeHeaders(req)
-	firstHeader := true
-	for len(hdrsInBytes) > 0 {
-		chunk := hdrsInBytes
-		if len(chunk) > int(cc.maxFrameSize) {
-			chunk = chunk[:cc.maxFrameSize]
-		}
-
-		hdrsInBytes = hdrsInBytes[len(chunk):]
-		if firstHeader {
-			cc.fr.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      cs.ID,
-				BlockFragment: chunk,
-				EndHeaders:    len(hdrsInBytes) == 0,
-				EndStream:     !hasBody,
-			})
-			firstHeader = false
-		} else {
-			cc.fr.WriteContinuation(cs.ID, len(hdrsInBytes) == 0, chunk)
-		}
-	}
-
-	cc.bw.Flush()
-	if cc.werr != nil {
-		return nil, cc.werr
-	}
-
-	resp := <-cs.resc
 	return resp, nil
 }
 
@@ -231,6 +211,26 @@ func (cc *ClientConn) readLoop() {
 	cc.readerErr = rl.run()
 }
 
+func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
+
+	// body := req.Body
+	contentLength := req.ContentLength
+	hasBody := contentLength != 0
+
+	hdrs := cc.encodeHeaders(req)
+
+	cs := cc.newStream()
+	cs.req = req
+	endStream := !hasBody
+	err := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	if err != nil {
+		return nil, err
+	}
+
+	res := <-cs.resc
+	return res.res, nil
+}
+
 func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
 	cc.hbuf.Reset()
 	var host = req.Host
@@ -256,6 +256,10 @@ func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
 	return cc.hbuf.Bytes()
 }
 
+func (cc *ClientConn) writeHeaders(streamID uint32, enStream bool, maxFrameSize int, hdrs []byte) error {
+	return nil
+}
+
 func (cc *ClientConn) writeHeader(name, value string) {
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }
@@ -265,11 +269,13 @@ func (cc *ClientConn) newStream() *clientStream {
 	defer cc.mu.Unlock()
 
 	cs := &clientStream{
+		cc:   cc,
 		ID:   cc.nextStreamID,
-		resc: make(chan *http.Response, 1),
+		resc: make(chan h2Resp, 1),
+		done: make(chan struct{}),
 	}
-	cc.streams[cs.ID] = cs
 	cc.nextStreamID += 2
+	cc.streams[cs.ID] = cs
 	return cs
 }
 
