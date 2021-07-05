@@ -102,40 +102,6 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	f, err := cc.fr.ReadFrame()
-	if err != nil {
-		return nil, err
-	}
-	fmt.Printf("Get frame: %#v\n", f)
-
-	sf, ok := f.(*http2.SettingsFrame)
-	if !ok {
-		return nil, fmt.Errorf("expect a settings frame")
-	}
-	cc.fr.WriteSettingsAck()
-	cc.bw.Flush()
-
-	//Todo:
-	/*
-		Setting frame: [INITIAL_WINDOW_SIZE = 67108864]
-		Setting frame: [MAX_CONCURRENT_STREAMS = 100]
-		Setting frame: [MAX_FRAME_SIZE = 65536]
-	*/
-	sf.ForeachSetting(func(s http2.Setting) error {
-		fmt.Printf("Setting frame: %v\n", s)
-		switch s.ID {
-		case http2.SettingMaxFrameSize:
-			cc.maxFrameSize = s.Val
-		default:
-			fmt.Printf("Unhandled setting: %v", s)
-		}
-		return nil
-	})
-
-	cc.hdec = hpack.NewDecoder(initialHeaderTableSize, cc.onNewHeaderField)
-
-	go cc.readLoop()
-
 	cs := cc.newStream()
 	hasBody := false
 
@@ -261,57 +227,8 @@ func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
 }
 
 func (cc *ClientConn) readLoop() {
-	defer close(cc.readDone)
-	for {
-		f, err := cc.fr.ReadFrame()
-		if err != nil {
-			fmt.Println("readFrame error: ", err)
-			cc.readerErr = err
-			return
-		}
-
-		fmt.Printf("Read %v: %v\n", f.Header(), f)
-		cs := cc.getStreamByID(f.Header().StreamID)
-
-		headerEnd := false
-		streamEnd := false
-
-		switch f := f.(type) {
-		case *http2.HeadersFrame:
-			cc.respHeaders = make(http.Header)
-			cs.pr, cs.pw = io.Pipe()
-
-			cc.hdec.Write(f.HeaderBlockFragment())
-			headerEnd = f.HeadersEnded()
-			streamEnd = f.StreamEnded()
-
-		case *http2.ContinuationFrame:
-			cc.hdec.Write(f.HeaderBlockFragment())
-			headerEnd = f.HeadersEnded()
-			streamEnd = f.Header().Flags.Has(http2.FlagHeadersEndStream)
-
-		case *http2.DataFrame:
-			fmt.Printf("data: %v\n", f.Data())
-			if cs != nil {
-				cs.pw.Write(f.Data())
-			}
-		}
-
-		if streamEnd {
-			cs.pw.Close()
-		}
-
-		if headerEnd {
-			if cs == nil {
-				panic("stream not found")
-			}
-
-			cs.resc <- &http.Response{
-				Header: cc.respHeaders,
-				Body:   cs.pr,
-			}
-		}
-	}
+	rl := &connReadLoop{cc: cc}
+	cc.readerErr = rl.run()
 }
 
 func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
