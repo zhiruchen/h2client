@@ -213,6 +213,7 @@ func (cc *ClientConn) readLoop() {
 
 func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 
+	cc.mu.Lock()
 	// body := req.Body
 	contentLength := req.ContentLength
 	hasBody := contentLength != 0
@@ -222,9 +223,11 @@ func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cs := cc.newStream()
 	cs.req = req
 	endStream := !hasBody
-	err := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
-	if err != nil {
-		return nil, err
+	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	cc.mu.Unlock()
+
+	if werr != nil {
+		fmt.Printf("[roundTrip] writeHeaders error: %v\n", werr)
 	}
 
 	res := <-cs.resc
@@ -256,8 +259,35 @@ func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
 	return cc.hbuf.Bytes()
 }
 
-func (cc *ClientConn) writeHeaders(streamID uint32, enStream bool, maxFrameSize int, hdrs []byte) error {
-	return nil
+func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
+	first := false // first frame written
+
+	for len(hdrs) > 0 && cc.werr == nil {
+		chunk := hdrs
+		if len(chunk) > maxFrameSize {
+			chunk = chunk[:maxFrameSize]
+		}
+
+		hdrs = hdrs[len(chunk):]
+		endHeaders := len(hdrs) == 0
+
+		if first {
+			cc.fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID:      streamID,
+				BlockFragment: chunk,
+				EndStream:     endStream,
+				EndHeaders:    endHeaders,
+			})
+
+			first = false
+			continue
+		}
+
+		cc.fr.WriteContinuation(streamID, endHeaders, chunk)
+	}
+
+	cc.bw.Flush()
+	return cc.werr
 }
 
 func (cc *ClientConn) writeHeader(name, value string) {
