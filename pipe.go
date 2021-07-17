@@ -16,6 +16,8 @@ type pipe struct {
 	b  pipeBuffer
 }
 
-func (p *pipe) CloseWithErr(err error) {
+func (p *pipe) CloseWithErr(err error) {}
 
+func (p *pipe) Write(d []byte) (n int, err error) {
+	return -1, nil
 }

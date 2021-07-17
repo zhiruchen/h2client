@@ -44,6 +44,7 @@ func (rl *connReadLoop) run() error {
 		case *http2.MetaHeadersFrame:
 			err = rl.processheaders(f)
 		case *http2.DataFrame:
+			err = rl.processData(f)
 		case *http2.GoAwayFrame:
 		case *http2.RSTStreamFrame:
 		case *http2.SettingsFrame:
@@ -90,7 +91,41 @@ func (rl *connReadLoop) processheaders(f *http2.MetaHeadersFrame) error {
 	return nil
 }
 
-func (tl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFrame) (*http.Response, error) {
+func (rl *connReadLoop) processData(f *http2.DataFrame) error {
+	cc := rl.cc
+	cs := cc.getStreamByID(f.StreamID)
+	data := f.Data()
+	if cs == nil {
+		return nil
+	}
+
+	if f.Length > 0 {
+		// received DATA on a HEAD request
+		if cs.req.Method == "HEAD" && len(data) > 0 {
+			rl.endStreamError(cs, http2.StreamError{
+				StreamID: f.StreamID,
+				Code:     http2.ErrCodeProtocol,
+			})
+			return nil
+		}
+
+		// todo: check connection level flow control
+		if len(data) > 0 && !cs.didReset {
+			if _, err := cs.bufPipe.Write(data); err != nil {
+				rl.endStreamError(cs, err)
+				return err
+			}
+		}
+	}
+
+	if f.StreamEnded() {
+		rl.endStream(cs)
+	}
+
+	return nil
+}
+
+func (rl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFrame) (*http.Response, error) {
 	if f.Truncated {
 		return nil, errResponseHeaderExceedLimit
 	}
@@ -148,4 +183,12 @@ func (tl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFra
 
 	//todo: handle gzip
 	return res, nil
+}
+
+func (rl *connReadLoop) endStream(cs *clientStream) {
+	rl.endStreamError(cs, nil)
+}
+
+func (rl *connReadLoop) endStreamError(cs *clientStream, err error) {
+
 }
