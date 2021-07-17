@@ -46,6 +46,7 @@ func (rl *connReadLoop) run() error {
 		case *http2.DataFrame:
 			err = rl.processData(f)
 		case *http2.GoAwayFrame:
+			err = rl.processgoAway(f)
 		case *http2.RSTStreamFrame:
 		case *http2.SettingsFrame:
 		case *http2.WindowUpdateFrame:
@@ -122,6 +123,16 @@ func (rl *connReadLoop) processData(f *http2.DataFrame) error {
 		rl.endStream(cs)
 	}
 
+	return nil
+}
+
+func (rl *connReadLoop) processgoAway(f *http2.GoAwayFrame) error {
+	cc := rl.cc
+	cc.t.ConnPool.MarkDead(cc)
+	if f.ErrCode != 0 {
+		fmt.Printf("[connReadLoop] got GoAway with error code = %v", f.ErrCode)
+	}
+	cc.setGoAway(f)
 	return nil
 }
 

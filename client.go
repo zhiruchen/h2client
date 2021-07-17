@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,8 @@ import (
 
 var (
 	clientPreface = []byte(http2.ClientPreface)
+
+	errClientConnGotGoAway = errors.New("[http2] transport received server's GoAway")
 )
 
 const (
@@ -49,6 +52,8 @@ type ClientConn struct {
 	peerMaxHeaderListSize uint64
 
 	mu           sync.Mutex
+	goAway       *http2.GoAwayFrame
+	goAwayDebug  string
 	streams      map[uint32]*clientStream
 	nextStreamID uint32
 }
@@ -202,6 +207,32 @@ func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 
 	go cc.readLoop()
 	return cc, nil
+}
+
+func (cc *ClientConn) setGoAway(f *http2.GoAwayFrame) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	old := cc.goAway
+	cc.goAway = f
+
+	if cc.goAwayDebug == "" {
+		cc.goAwayDebug = string(f.DebugData())
+	}
+
+	if old != nil && old.ErrCode != http2.ErrCodeNo {
+		cc.goAway.ErrCode = old.ErrCode
+	}
+
+	last := f.LastStreamID
+	for streamID, cs := range cc.streams {
+		if streamID > last {
+			select {
+			case cs.resc <- h2Resp{err: errClientConnGotGoAway}:
+			default:
+			}
+		}
+	}
 }
 
 func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
