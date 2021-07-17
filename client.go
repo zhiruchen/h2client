@@ -62,9 +62,11 @@ type clientStream struct {
 	cc  *ClientConn
 	req *http.Request
 
-	ID      uint32
-	resc    chan h2Resp
-	bufPipe pipe
+	ID          uint32
+	resc        chan h2Resp
+	bufPipe     pipe
+	bytesRemain int64
+	didReset    bool
 
 	done chan struct{}
 
@@ -113,8 +115,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	fmt.Printf("get cc: %+v\n", cc)
 
-	return resp, nil
+	return &http.Response{}, nil
 }
 
 func authorityAddr(scheme string, authority string) (addr string) {

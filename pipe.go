@@ -15,3 +15,7 @@ type pipe struct {
 	mu sync.Mutex
 	b  pipeBuffer
 }
+
+func (p *pipe) CloseWithErr(err error) {
+
+}
