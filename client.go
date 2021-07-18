@@ -38,7 +38,6 @@ type ClientConn struct {
 
 	readDone  chan struct{} // close on error
 	readerErr error         // set after readDone is closed
-	werr      error         // first write error  occured
 
 	hbuf bytes.Buffer
 	henc *hpack.Encoder
@@ -51,11 +50,15 @@ type ClientConn struct {
 	maxConcurrentStreams  uint32
 	peerMaxHeaderListSize uint64
 
-	mu           sync.Mutex
-	goAway       *http2.GoAwayFrame
-	goAwayDebug  string
-	streams      map[uint32]*clientStream
-	nextStreamID uint32
+	mu              sync.Mutex
+	wantSettingsAck bool // client send settings frame, have not ack frame
+	goAway          *http2.GoAwayFrame
+	goAwayDebug     string
+	streams         map[uint32]*clientStream
+	nextStreamID    uint32
+
+	wmu  sync.Mutex
+	werr error // first write error  occured
 }
 
 type h2Resp struct {

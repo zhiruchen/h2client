@@ -3,6 +3,7 @@ package h2client
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -49,6 +50,7 @@ func (rl *connReadLoop) run() error {
 			err = rl.processgoAway(f)
 		case *http2.RSTStreamFrame:
 		case *http2.SettingsFrame:
+			err = rl.processSettings(f)
 		case *http2.WindowUpdateFrame:
 		case *http2.PingFrame:
 		default:
@@ -134,6 +136,54 @@ func (rl *connReadLoop) processgoAway(f *http2.GoAwayFrame) error {
 	}
 	cc.setGoAway(f)
 	return nil
+}
+
+func (rl *connReadLoop) processSettings(f *http2.SettingsFrame) error {
+	cc := rl.cc
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	if f.IsAck() {
+		if cc.wantSettingsAck {
+			cc.wantSettingsAck = false
+			return nil
+		}
+
+		return http2.ConnectionError(http2.ErrCodeProtocol)
+	}
+
+	err := f.ForeachSetting(func(s http2.Setting) error {
+		switch s.ID {
+		case http2.SettingMaxFrameSize:
+			cc.maxFrameSize = s.Val
+		case http2.SettingMaxConcurrentStreams:
+			cc.maxConcurrentStreams = s.Val
+		case http2.SettingMaxHeaderListSize:
+			cc.peerMaxHeaderListSize = uint64(s.Val)
+		case http2.SettingInitialWindowSize:
+			if s.Val > math.MaxInt32 {
+				return http2.ConnectionError(http2.ErrCodeFlowControl)
+			}
+
+			//todo: handle flow control
+
+			cc.initialWindowSize = s.Val
+		default:
+			fmt.Printf("Unhandled setting: %v", s)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	cc.wmu.Lock()
+	defer cc.wmu.Unlock()
+
+	cc.fr.WriteSettingsAck()
+	cc.bw.Flush()
+	return cc.werr
 }
 
 func (rl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFrame) (*http.Response, error) {
