@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -252,14 +253,21 @@ func (cc *ClientConn) readLoop() {
 	cc.readerErr = rl.run()
 }
 
-func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
+func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
+	return cc.roundTrip(req)
+}
 
+func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Lock()
 	// body := req.Body
 	contentLength := req.ContentLength
 	hasBody := contentLength != 0
 
-	hdrs := cc.encodeHeaders(req)
+	hdrs, err := cc.encodeHeaders(req)
+	if err != nil {
+		cc.mu.Unlock()
+		return nil, err
+	}
 
 	cs := cc.newStream()
 	cs.req = req
@@ -275,11 +283,43 @@ func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	return res.res, nil
 }
 
-func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
+func (cc *ClientConn) encodeHeaders(req *http.Request) ([]byte, error) {
 	cc.hbuf.Reset()
 	var host = req.Host
 	if host == "" {
 		host = req.URL.Host
+	}
+
+	host, err := httpguts.PunycodeHostPort(host)
+	if err != nil {
+		return nil, err
+	}
+
+	var path string
+	if req.Method != "CONNECT" {
+		path = req.URL.RequestURI()
+		if !validPseudoPath(path) {
+			orig := path
+			path = strings.TrimPrefix(path, req.URL.Scheme+"://"+host)
+			if !validPseudoPath(path) {
+				if req.URL.Opaque != "" {
+					return nil, fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
+				} else {
+					return nil, fmt.Errorf("invalid request :path %q", orig)
+				}
+			}
+		}
+	}
+
+	for header, vals := range req.Header {
+		if !httpguts.ValidHeaderFieldName(header) {
+			return nil, fmt.Errorf("invalid HTTP header name %q", header)
+		}
+		for _, val := range vals {
+			if !httpguts.ValidHeaderFieldValue(val) {
+				return nil, fmt.Errorf("invalid HTTP header value %q for header %q", val, header)
+			}
+		}
 	}
 
 	cc.writeHeader(":method", req.Method)
@@ -297,7 +337,14 @@ func (cc *ClientConn) encodeHeaders(req *http.Request) []byte {
 		cc.writeHeader("host", host)
 	}
 
-	return cc.hbuf.Bytes()
+	return cc.hbuf.Bytes(), nil
+}
+
+// a valid :path pseudo-header is
+// 1) non-empty string start with '/
+// 2) the string '*', for OPTIONS request
+func validPseudoPath(path string) bool {
+	return (len(path) > 0 && path[0] == '/') || path == "*"
 }
 
 func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
