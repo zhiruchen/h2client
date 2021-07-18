@@ -51,6 +51,7 @@ type ClientConn struct {
 	peerMaxHeaderListSize uint64
 
 	mu              sync.Mutex
+	cond            *sync.Cond
 	wantSettingsAck bool // client send settings frame, have not ack frame
 	goAway          *http2.GoAwayFrame
 	goAwayDebug     string
@@ -75,6 +76,9 @@ type clientStream struct {
 	bufPipe     pipe
 	bytesRemain int64
 	didReset    bool
+
+	peerReset  chan struct{}
+	resetError error
 
 	done chan struct{}
 

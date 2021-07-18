@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	errResponseHeaderExceedLimit = errors.New("http2: response header list larger than advertised limit")
+	errResponseHeaderExceedLimit = errors.New("[http2] response header list larger than advertised limit")
 	errMalformedResponse         = errors.New("[http2] malformed response from server: miss status header")
 	errStatusNotNumeric          = errors.New("[http2] malformed response from server: status code is non-numeric")
 )
@@ -49,6 +49,7 @@ func (rl *connReadLoop) run() error {
 		case *http2.GoAwayFrame:
 			err = rl.processgoAway(f)
 		case *http2.RSTStreamFrame:
+			err = rl.processResetStream(f)
 		case *http2.SettingsFrame:
 			err = rl.processSettings(f)
 		case *http2.WindowUpdateFrame:
@@ -135,6 +136,26 @@ func (rl *connReadLoop) processgoAway(f *http2.GoAwayFrame) error {
 		fmt.Printf("[connReadLoop] got GoAway with error code = %v", f.ErrCode)
 	}
 	cc.setGoAway(f)
+	return nil
+}
+
+func (rl *connReadLoop) processResetStream(f *http2.RSTStreamFrame) error {
+	cs := rl.cc.getStreamByID(f.StreamID)
+	if cs == nil {
+		return nil
+	}
+
+	select {
+	// this is the only goroutine close peerReset, So there is no race
+	case <-cs.peerReset:
+	default:
+		err := http2.StreamError{StreamID: cs.ID, Code: f.ErrCode}
+		cs.resetError = err
+		close(cs.peerReset)
+		cs.bufPipe.CloseWithErr(err)
+		cs.cc.cond.Broadcast()
+	}
+
 	return nil
 }
 
