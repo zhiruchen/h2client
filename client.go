@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -263,7 +264,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	contentLength := req.ContentLength
 	hasBody := contentLength != 0
 
-	hdrs, err := cc.encodeHeaders(req)
+	hdrs, err := cc.encodeHeaders(req, contentLength)
 	if err != nil {
 		cc.mu.Unlock()
 		return nil, err
@@ -283,7 +284,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	return res.res, nil
 }
 
-func (cc *ClientConn) encodeHeaders(req *http.Request) ([]byte, error) {
+func (cc *ClientConn) encodeHeaders(req *http.Request, contentLength int64) ([]byte, error) {
 	cc.hbuf.Reset()
 	var host = req.Host
 	if host == "" {
@@ -322,22 +323,43 @@ func (cc *ClientConn) encodeHeaders(req *http.Request) ([]byte, error) {
 		}
 	}
 
+	cc.writeHeader(":authority", host)
 	cc.writeHeader(":method", req.Method)
 	cc.writeHeader(":scheme", "https")
-	cc.writeHeader(":authority", host)
-	cc.writeHeader(":path", req.URL.Path)
 
-	for k, vs := range req.Header {
-		for _, v := range vs {
+	if req.Method != "CONNECT" {
+		cc.writeHeader(":path", path)
+		cc.writeHeader(":scheme", req.URL.Scheme)
+	}
+
+	if shouldSendReqContentLength(req.Method, contentLength) {
+		cc.writeHeader("content-length", strconv.FormatInt(contentLength, 10))
+	}
+
+	for k, headers := range req.Header {
+		for _, v := range headers {
 			cc.writeHeader(strings.ToLower(k), v)
 		}
 	}
 
-	if _, ok := req.Header[http.CanonicalHeaderKey("Host")]; !ok {
-		cc.writeHeader("host", host)
+	return cc.hbuf.Bytes(), nil
+}
+
+func shouldSendReqContentLength(method string, contentLength int64) bool {
+	if contentLength > 0 {
+		return true
 	}
 
-	return cc.hbuf.Bytes(), nil
+	if contentLength < 0 {
+		return false
+	}
+
+	switch method {
+	case "POST", "PUT", "PATCH":
+		return true
+	default:
+		return false
+	}
 }
 
 // a valid :path pseudo-header is
