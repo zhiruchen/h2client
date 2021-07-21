@@ -53,7 +53,9 @@ func (rl *connReadLoop) run() error {
 		case *http2.SettingsFrame:
 			err = rl.processSettings(f)
 		case *http2.WindowUpdateFrame:
+			err = rl.processWindowUpdate(f)
 		case *http2.PingFrame:
+			err = rl.processPing(f)
 		default:
 			fmt.Printf("[Transport] unhandled resp frame: %T\n", f)
 		}
@@ -205,6 +207,51 @@ func (rl *connReadLoop) processSettings(f *http2.SettingsFrame) error {
 	cc.fr.WriteSettingsAck()
 	cc.bw.Flush()
 	return cc.werr
+}
+
+func (rl *connReadLoop) processWindowUpdate(f *http2.WindowUpdateFrame) error {
+	cc := rl.cc
+	cs := cc.getStreamByID(f.StreamID)
+	if f.StreamID != 0 && cs == nil {
+		return nil
+	}
+
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	flow := &cc.flow
+	if cs != nil {
+		flow = &cs.flow
+	}
+
+	if !flow.add(int32(f.Increment)) {
+		return http2.ConnectionError(http2.ErrCodeFlowControl)
+	}
+	cc.cond.Broadcast()
+	return nil
+}
+
+func (rl *connReadLoop) processPing(f *http2.PingFrame) error {
+	cc := rl.cc
+
+	if f.IsAck() {
+		cc.mu.Lock()
+		defer cc.mu.Unlock()
+
+		if c, ok := cc.pings[f.Data]; ok {
+			close(c)
+			delete(cc.pings, f.Data)
+		}
+		return nil
+	}
+
+	cc.wmu.Lock()
+	defer cc.wmu.Unlock()
+
+	if err := cc.fr.WritePing(true, f.Data); err != nil {
+		return err
+	}
+	return cc.bw.Flush()
 }
 
 func (rl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFrame) (*http.Response, error) {

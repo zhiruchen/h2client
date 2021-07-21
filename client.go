@@ -52,13 +52,16 @@ type ClientConn struct {
 	maxConcurrentStreams  uint32
 	peerMaxHeaderListSize uint64
 
-	mu              sync.Mutex
-	cond            *sync.Cond
+	mu   sync.Mutex
+	cond *sync.Cond
+	flow flow
+
 	wantSettingsAck bool // client send settings frame, have not ack frame
 	goAway          *http2.GoAwayFrame
 	goAwayDebug     string
 	streams         map[uint32]*clientStream
 	nextStreamID    uint32
+	pings           map[[8]byte]chan struct{}
 
 	wmu  sync.Mutex
 	werr error // first write error  occured
@@ -76,6 +79,7 @@ type clientStream struct {
 	ID          uint32
 	resc        chan h2Resp
 	bufPipe     pipe
+	flow        flow
 	bytesRemain int64
 	didReset    bool
 
@@ -190,7 +194,11 @@ func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 		peerMaxHeaderListSize: 0xffffffffffffffff,
 		readDone:              make(chan struct{}),
 		streams:               make(map[uint32]*clientStream),
+		pings:                 make(map[[8]byte]chan struct{}),
 	}
+
+	cc.cond = sync.NewCond(&cc.mu)
+	cc.flow.add(int32(cc.initialWindowSize))
 
 	cc.bw = bufio.NewWriter(stickyErrWriter{conn, &cc.werr})
 	cc.br = bufio.NewReader(cc.conn)
