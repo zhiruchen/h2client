@@ -1,6 +1,7 @@
 package h2client
 
 import (
+	"crypto/tls"
 	"net/http"
 	"sync"
 )
@@ -14,9 +15,10 @@ type ClientConnPool interface {
 type clientConnPool struct {
 	t *Transport
 
-	mu    sync.Mutex
-	conns map[string][]*ClientConn // key: host:port
-	keys  map[*ClientConn][]string
+	mu           sync.Mutex
+	conns        map[string][]*ClientConn // key: host:port
+	keys         map[*ClientConn][]string
+	addConnCalls map[string]*addConnCall // in-flight addConnIfNeed calls
 }
 
 func (p *clientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
@@ -47,6 +49,52 @@ func (p *clientConnPool) MarkDead(cc *ClientConn) {
 	}
 
 	delete(p.keys, cc)
+}
+
+type addConnCall struct {
+	p    *clientConnPool
+	done chan struct{}
+	err  error
+}
+
+func (c *addConnCall) run(t *Transport, key string, tc *tls.Conn) {
+	cc, err := t.NewClientConn(tc)
+
+	p := c.p
+	p.mu.Lock()
+	if err != nil {
+		c.err = err
+	} else {
+		p.addConnLocked(key, cc)
+	}
+
+	delete(p.addConnCalls, key)
+	p.mu.Unlock()
+	close(c.done)
+}
+
+func (p *clientConnPool) addConn(key string, cc *ClientConn) {
+	p.mu.Lock()
+	p.addConnLocked(key, cc)
+	p.mu.Unlock()
+}
+
+func (p *clientConnPool) addConnLocked(key string, cc *ClientConn) {
+	for _, v := range p.conns[key] {
+		if v == cc {
+			return
+		}
+	}
+
+	if p.conns == nil {
+		p.conns = make(map[string][]*ClientConn)
+	}
+
+	if p.keys == nil {
+		p.keys = make(map[*ClientConn][]string)
+	}
+	p.conns[key] = append(p.conns[key], cc)
+	p.keys[cc] = append(p.keys[cc], key)
 }
 
 func filterOutClientConn(conns []*ClientConn, exclude *ClientConn) []*ClientConn {

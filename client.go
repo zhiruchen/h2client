@@ -25,6 +25,8 @@ var (
 )
 
 const (
+	defaultConnFlow        = 1 << 30
+	initialWindowSize      = 65535
 	initialHeaderTableSize = 4096
 )
 
@@ -52,9 +54,10 @@ type ClientConn struct {
 	maxConcurrentStreams  uint32
 	peerMaxHeaderListSize uint64
 
-	mu   sync.Mutex
-	cond *sync.Cond
-	flow flow
+	mu     sync.Mutex
+	cond   *sync.Cond
+	flow   flow
+	inflow flow
 
 	wantSettingsAck bool // client send settings frame, have not ack frame
 	goAway          *http2.GoAwayFrame
@@ -183,17 +186,22 @@ func (t *Transport) dialClientConn(addr string) (*ClientConn, error) {
 	return t.newClientConn(tlsConn)
 }
 
+func (t *Transport) NewClientConn(conn net.Conn) (*ClientConn, error) {
+	return t.newClientConn(conn)
+}
+
 func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 	cc := &ClientConn{
 		t:                     t,
 		tconn:                 conn,
+		readDone:              make(chan struct{}),
 		nextStreamID:          1,
 		maxFrameSize:          16 << 10,
-		initialWindowSize:     65535,
+		initialWindowSize:     initialWindowSize,
 		maxConcurrentStreams:  1000,
 		peerMaxHeaderListSize: 0xffffffffffffffff,
-		readDone:              make(chan struct{}),
 		streams:               make(map[uint32]*clientStream),
+		wantSettingsAck:       true,
 		pings:                 make(map[[8]byte]chan struct{}),
 	}
 
@@ -216,7 +224,8 @@ func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
-	cc.fr.WriteWindowUpdate(0, 1<<30)
+	cc.fr.WriteWindowUpdate(0, defaultConnFlow)
+	cc.inflow.add(defaultConnFlow + initialWindowSize)
 	cc.bw.Flush()
 	if cc.werr != nil {
 		return nil, cc.werr
@@ -260,6 +269,11 @@ func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
 func (cc *ClientConn) readLoop() {
 	rl := &connReadLoop{cc: cc}
 	cc.readerErr = rl.run()
+	if ce, ok := cc.readerErr.(http2.ConnectionError); ok {
+		cc.wmu.Lock()
+		cc.fr.WriteGoAway(0, http2.ErrCode(ce), nil)
+		cc.mu.Unlock()
+	}
 }
 
 func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
