@@ -51,6 +51,38 @@ func (p *clientConnPool) MarkDead(cc *ClientConn) {
 	delete(p.keys, cc)
 }
 
+func (p *clientConnPool) addConnIfNeed(key string, t *Transport, conn *tls.Conn) (bool, error) {
+	p.mu.Lock()
+	for _, cc := range p.conns[key] {
+		if cc.CanTakeNewRequest() {
+			p.mu.Unlock()
+			return false, nil
+		}
+	}
+
+	call, ok := p.addConnCalls[key]
+	if !ok {
+		if p.addConnCalls == nil {
+			p.addConnCalls = make(map[string]*addConnCall)
+		}
+
+		call = &addConnCall{
+			p:    p,
+			done: make(chan struct{}),
+		}
+		p.addConnCalls[key] = call
+		go call.run(t, key, conn)
+	}
+	p.mu.Unlock()
+
+	<-call.done
+	if call.err != nil {
+		return false, call.err
+	}
+
+	return !ok, nil
+}
+
 type addConnCall struct {
 	p    *clientConnPool
 	done chan struct{}

@@ -261,6 +261,10 @@ func (cc *ClientConn) setGoAway(f *http2.GoAwayFrame) {
 	}
 }
 
+func (cc *ClientConn) CanTakeNewRequest() bool {
+	return false
+}
+
 func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
 	fmt.Println("Header Field: ", hf)
 	cc.respHeaders.Add(http.CanonicalHeaderKey(hf.Name), hf.Value)
