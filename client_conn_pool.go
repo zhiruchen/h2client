@@ -4,6 +4,9 @@ import (
 	"crypto/tls"
 	"net/http"
 	"sync"
+
+	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2"
 )
 
 // ClientConnPool Manage pool of HTTP/2 client connection
@@ -21,13 +24,32 @@ type clientConnPool struct {
 	addConnCalls map[string]*addConnCall // in-flight addConnIfNeed calls
 }
 
-func (p *clientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
-	if req.Close {
-		return p.t.dialClientConn(addr)
+func (p *clientConnPool) GetClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {
+	if useSingleConnectionForRequest(req) && dialOnMiss {
+		cc, err := p.t.dialClientConn(addr, true)
+		if err != nil {
+			return nil, err
+		}
+		return cc, nil
 	}
 
-	// todo: handle get client conn from pool
-	return p.t.dialClientConn(addr)
+	p.mu.Lock()
+	for _, cc := range p.conns[addr] {
+		if st := cc.idleState(); st.canTakeNewRequest {
+			p.mu.Unlock()
+			return cc, nil
+		}
+	}
+
+	if !dialOnMiss {
+		p.mu.Unlock()
+		return nil, http2.ErrNoCachedConn
+	}
+
+	call := p.getStartDialLocked(addr)
+	p.mu.Unlock()
+	<-call.done
+	return call.res, call.err
 }
 
 func (p *clientConnPool) MarkDead(cc *ClientConn) {
@@ -143,4 +165,8 @@ func filterOutClientConn(conns []*ClientConn, exclude *ClientConn) []*ClientConn
 	}
 
 	return out
+}
+
+func useSingleConnectionForRequest(req *http.Request) bool {
+	return req.Close || httpguts.HeaderValuesContainsToken(req.Header["Connection"], "close")
 }

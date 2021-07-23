@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
@@ -31,14 +32,17 @@ const (
 )
 
 type ClientConn struct {
-	t        *Transport
-	tconn    net.Conn
-	tlsState *tls.ConnectionState
+	t         *Transport
+	tconn     net.Conn
+	tlsState  *tls.ConnectionState
+	singleUse bool
 
-	conn *tls.Conn
-	bw   *bufio.Writer
-	br   *bufio.Reader
-	fr   *http2.Framer
+	idleTimeout time.Duration
+	idleTimer   *time.Timer
+
+	bw *bufio.Writer
+	br *bufio.Reader
+	fr *http2.Framer
 
 	readDone  chan struct{} // close on error
 	readerErr error         // set after readDone is closed
@@ -68,6 +72,10 @@ type ClientConn struct {
 
 	wmu  sync.Mutex
 	werr error // first write error  occured
+}
+
+type connectionStater interface {
+	ConnectionState() tls.ConnectionState
 }
 
 type h2Resp struct {
@@ -111,6 +119,7 @@ func (se stickyErrWriter) Write(p []byte) (int, error) {
 }
 
 type Transport struct {
+	DialTLS         func(network, addr string, cfg *tls.Config) (net.Conn, error)
 	TLSClientConfig *tls.Config
 	ConnPool        ClientConnPool
 
@@ -155,42 +164,89 @@ func authorityAddr(scheme string, authority string) (addr string) {
 	return net.JoinHostPort(host, port)
 }
 
-func (t *Transport) dialClientConn(addr string) (*ClientConn, error) {
+func (t *Transport) dialClientConn(addr string, singleUse bool) (*ClientConn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName: host,
-		NextProtos: []string{http2.NextProtoTLS},
-	}
-	tlsConn, err := tls.Dial("tcp", addr, tlsConfig)
+	tconn, err := t.dialTLS()("tcp", addr, t.newTLSConfig(host))
 	if err != nil {
 		return nil, err
 	}
 
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
-	}
-	if err := tlsConn.VerifyHostname(tlsConfig.ServerName); err != nil {
-		return nil, err
-	}
-
-	state := tlsConn.ConnectionState()
-	fmt.Printf("conn state: %+v\n", state)
-	if p := state.NegotiatedProtocol; p != http2.NextProtoTLS {
-		return nil, fmt.Errorf("bad protocol: %v", p)
-	}
-
-	return t.newClientConn(tlsConn)
+	return t.newClientConn(tconn, singleUse)
 }
 
 func (t *Transport) NewClientConn(conn net.Conn) (*ClientConn, error) {
-	return t.newClientConn(conn)
+	return t.newClientConn(conn, false)
 }
 
-func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
+func (t *Transport) dialTLS() func(string, string, *tls.Config) (net.Conn, error) {
+	if t.DialTLS != nil {
+		return t.DialTLS
+	}
+
+	return t.dialTLSDefault
+}
+
+func (t *Transport) newTLSConfig(host string) *tls.Config {
+	cfg := new(tls.Config)
+
+	if t.TLSClientConfig != nil {
+		*cfg = *cloneTLSConfig(t.TLSClientConfig)
+	}
+
+	containsNextProto := false
+	for _, s := range cfg.NextProtos {
+		if s == http2.NextProtoTLS {
+			containsNextProto = true
+			break
+		}
+	}
+
+	if !containsNextProto {
+		cfg.NextProtos = append([]string{http2.NextProtoTLS}, cfg.NextProtos...)
+	}
+	if cfg.ServerName == "" {
+		cfg.ServerName = host
+	}
+	return cfg
+}
+
+func cloneTLSConfig(cfg *tls.Config) *tls.Config {
+	cp := cfg.Clone()
+	cp.GetClientCertificate = cfg.GetClientCertificate
+	return cp
+}
+
+func (t *Transport) dialTLSDefault(network, addr string, cfg *tls.Config) (net.Conn, error) {
+	cn, err := tls.Dial(network, addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := cn.Handshake(); err != nil {
+		return nil, err
+	}
+
+	if !cfg.InsecureSkipVerify {
+		if err := cn.VerifyHostname(cfg.ServerName); err != nil {
+			return nil, err
+		}
+	}
+	state := cn.ConnectionState()
+	if p := state.NegotiatedProtocol; p != http2.NextProtoTLS {
+		return nil, fmt.Errorf("[http2] unexpected ALPN protocol %s; want %s", p, http2.NextProtoTLS)
+	}
+
+	if !state.NegotiatedProtocolIsMutual {
+		return nil, errors.New("[http2] could not negotiate protocol mutually")
+	}
+
+	return cn, nil
+}
+
+func (t *Transport) newClientConn(conn net.Conn, singleUse bool) (*ClientConn, error) {
 	cc := &ClientConn{
 		t:                     t,
 		tconn:                 conn,
@@ -201,6 +257,7 @@ func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 		maxConcurrentStreams:  1000,
 		peerMaxHeaderListSize: 0xffffffffffffffff,
 		streams:               make(map[uint32]*clientStream),
+		singleUse:             singleUse,
 		wantSettingsAck:       true,
 		pings:                 make(map[[8]byte]chan struct{}),
 	}
@@ -209,12 +266,17 @@ func (t *Transport) newClientConn(conn net.Conn) (*ClientConn, error) {
 	cc.flow.add(int32(cc.initialWindowSize))
 
 	cc.bw = bufio.NewWriter(stickyErrWriter{conn, &cc.werr})
-	cc.br = bufio.NewReader(cc.conn)
+	cc.br = bufio.NewReader(cc.tconn)
 	cc.fr = http2.NewFramer(cc.bw, cc.br)
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
 	cc.fr.MaxHeaderListSize = t.MaxHeaderListSize
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
+
+	if cs, ok := conn.(connectionStater); ok {
+		state := cs.ConnectionState()
+		cc.tlsState = &state
+	}
 
 	initialSettings := []http2.Setting{
 		{ID: http2.SettingEnablePush, Val: 0},

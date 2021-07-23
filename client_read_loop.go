@@ -43,7 +43,7 @@ func (rl *connReadLoop) run() error {
 
 		switch f := f.(type) {
 		case *http2.MetaHeadersFrame:
-			err = rl.processheaders(f)
+			err = rl.processHeaders(f)
 		case *http2.DataFrame:
 			err = rl.processData(f)
 		case *http2.GoAwayFrame:
@@ -67,7 +67,7 @@ func (rl *connReadLoop) run() error {
 	}
 }
 
-func (rl *connReadLoop) processheaders(f *http2.MetaHeadersFrame) error {
+func (rl *connReadLoop) processHeaders(f *http2.MetaHeadersFrame) error {
 	cc := rl.cc
 
 	cs := cc.getStreamByID(f.StreamID)
