@@ -11,7 +11,7 @@ import (
 
 // ClientConnPool Manage pool of HTTP/2 client connection
 type ClientConnPool interface {
-	GetClientConn(req *http.Request, addr string) (*ClientConn, error)
+	GetClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error)
 	MarkDead(*ClientConn)
 }
 
@@ -40,11 +40,10 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 
 	p.mu.Lock()
 	for _, cc := range p.conns[addr] {
-		//todo: check cc.idleState, and return it
-		// if st := cc.idleState(); st.canTakeNewRequest {
-		// 	p.mu.Unlock()
-		// 	return cc, nil
-		// }
+		if st := cc.idleState(); st.canTakeNewRequest {
+			p.mu.Unlock()
+			return cc, nil
+		}
 		return cc, nil
 	}
 

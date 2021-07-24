@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -58,16 +59,19 @@ type ClientConn struct {
 	maxConcurrentStreams  uint32
 	peerMaxHeaderListSize uint64
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	flow   flow
-	inflow flow
+	mu      sync.Mutex
+	cond    *sync.Cond
+	flow    flow
+	inflow  flow
+	closing bool
+	closed  bool
 
 	wantSettingsAck bool // client send settings frame, have not ack frame
 	goAway          *http2.GoAwayFrame
 	goAwayDebug     string
 	streams         map[uint32]*clientStream
 	nextStreamID    uint32
+	pendingRequests int
 	pings           map[[8]byte]chan struct{}
 
 	wmu  sync.Mutex
@@ -325,6 +329,28 @@ func (cc *ClientConn) setGoAway(f *http2.GoAwayFrame) {
 
 func (cc *ClientConn) CanTakeNewRequest() bool {
 	return false
+}
+
+type clientConnIdleState struct {
+	canTakeNewRequest bool
+	freshConn         bool
+}
+
+func (cc *ClientConn) idleState() clientConnIdleState {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.idleStateLocked()
+}
+
+func (cc *ClientConn) idleStateLocked() (st clientConnIdleState) {
+	if cc.singleUse && cc.nextStreamID > 1 {
+		return
+	}
+
+	st.canTakeNewRequest = cc.goAway == nil && !cc.closed && !cc.closing &&
+		int64(cc.nextStreamID)+int64(cc.pendingRequests) < math.MaxInt32
+	st.freshConn = cc.nextStreamID == 1 && st.canTakeNewRequest
+	return st
 }
 
 func (cc *ClientConn) onNewHeaderField(hf hpack.HeaderField) {
