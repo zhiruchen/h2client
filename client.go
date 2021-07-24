@@ -27,9 +27,10 @@ var (
 )
 
 const (
-	defaultConnFlow        = 1 << 30
-	initialWindowSize      = 65535
-	initialHeaderTableSize = 4096
+	defaultConnFlow            = 1 << 30
+	defaultTransportStreamFlow = 4 << 20 // how many byte buffer per stream
+	initialWindowSize          = 65535
+	initialHeaderTableSize     = 4096
 )
 
 type ClientConn struct {
@@ -95,6 +96,7 @@ type clientStream struct {
 	resc        chan h2Resp
 	bufPipe     pipe
 	flow        flow
+	inflow      flow
 	bytesRemain int64
 	didReset    bool
 
@@ -541,15 +543,19 @@ func (cc *ClientConn) writeHeader(name, value string) {
 }
 
 func (cc *ClientConn) newStream() *clientStream {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
 	cs := &clientStream{
-		cc:   cc,
-		ID:   cc.nextStreamID,
-		resc: make(chan h2Resp, 1),
-		done: make(chan struct{}),
+		cc:        cc,
+		ID:        cc.nextStreamID,
+		resc:      make(chan h2Resp, 1),
+		peerReset: make(chan struct{}),
+		done:      make(chan struct{}),
 	}
+
+	cs.flow.add(int32(cc.initialWindowSize))
+	cs.flow.setConnflow(&cc.flow)
+	cs.inflow.add(defaultTransportStreamFlow)
+	cs.inflow.setConnflow(&cc.inflow)
+
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
 	return cs
