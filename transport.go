@@ -1,6 +1,9 @@
 package h2client
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 type resAndErr struct {
 	res *http.Response
@@ -17,4 +20,12 @@ func (rb resBody) Read(p []byte) (n int, err error) {
 
 func (rb resBody) Close() error {
 	return nil
+}
+
+func (t *Transport) idleConnTimeout() time.Duration {
+	if t.t1 != nil {
+		return t.t1.IdleConnTimeout
+	}
+
+	return 0
 }

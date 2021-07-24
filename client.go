@@ -129,7 +129,7 @@ type Transport struct {
 
 	// How many bytes of the response headers are allowed
 	MaxHeaderListSize uint32
-	t1                http.RoundTripper
+	t1                *http.Transport
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -266,6 +266,11 @@ func (t *Transport) newClientConn(conn net.Conn, singleUse bool) (*ClientConn, e
 		pings:                 make(map[[8]byte]chan struct{}),
 	}
 
+	if d := t.idleConnTimeout(); d > 0 {
+		cc.idleTimeout = d
+		cc.idleTimer = time.AfterFunc(d, cc.onIdleTimeout)
+	}
+
 	cc.cond = sync.NewCond(&cc.mu)
 	cc.flow.add(int32(cc.initialWindowSize))
 
@@ -329,6 +334,23 @@ func (cc *ClientConn) setGoAway(f *http2.GoAwayFrame) {
 
 func (cc *ClientConn) CanTakeNewRequest() bool {
 	return false
+}
+
+func (cc *ClientConn) onIdleTimeout() {
+	cc.closeIfIdle()
+}
+
+func (cc *ClientConn) closeIfIdle() {
+	cc.mu.Lock()
+	if len(cc.streams) > 0 {
+		cc.mu.Unlock()
+		return
+	}
+
+	cc.closed = true
+	_ = cc.nextStreamID
+	cc.mu.Unlock()
+	cc.tconn.Close()
 }
 
 type clientConnIdleState struct {
