@@ -20,11 +20,16 @@ type clientConnPool struct {
 
 	mu           sync.Mutex
 	conns        map[string][]*ClientConn // key: host:port
+	dialing      map[string]*dialCall     // current in-flight dials
 	keys         map[*ClientConn][]string
 	addConnCalls map[string]*addConnCall // in-flight addConnIfNeed calls
 }
 
 func (p *clientConnPool) GetClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {
+	return p.getClientConn(req, addr, dialOnMiss)
+}
+
+func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {
 	if useSingleConnectionForRequest(req) && dialOnMiss {
 		cc, err := p.t.dialClientConn(addr, true)
 		if err != nil {
@@ -35,10 +40,12 @@ func (p *clientConnPool) GetClientConn(req *http.Request, addr string, dialOnMis
 
 	p.mu.Lock()
 	for _, cc := range p.conns[addr] {
-		if st := cc.idleState(); st.canTakeNewRequest {
-			p.mu.Unlock()
-			return cc, nil
-		}
+		//todo: check cc.idleState, and return it
+		// if st := cc.idleState(); st.canTakeNewRequest {
+		// 	p.mu.Unlock()
+		// 	return cc, nil
+		// }
+		return cc, nil
 	}
 
 	if !dialOnMiss {
@@ -49,7 +56,42 @@ func (p *clientConnPool) GetClientConn(req *http.Request, addr string, dialOnMis
 	call := p.getStartDialLocked(addr)
 	p.mu.Unlock()
 	<-call.done
-	return call.res, call.err
+	return call.clientConn, call.err
+}
+
+// dialCall in-flight transport dial call to a host
+type dialCall struct {
+	p          *clientConnPool
+	done       chan struct{}
+	clientConn *ClientConn
+	err        error
+}
+
+func (p *clientConnPool) getStartDialLocked(addr string) *dialCall {
+	if call, ok := p.dialing[addr]; ok {
+		return call
+	}
+
+	call := &dialCall{p: p, done: make(chan struct{})}
+	if p.dialing == nil {
+		p.dialing = make(map[string]*dialCall)
+	}
+	p.dialing[addr] = call
+
+	go call.dial(addr)
+	return call
+}
+
+func (dc *dialCall) dial(addr string) {
+	dc.clientConn, dc.err = dc.p.t.dialClientConn(addr, true)
+	close(dc.done)
+
+	dc.p.mu.Lock()
+	delete(dc.p.dialing, addr)
+	if dc.err == nil {
+		dc.p.addConnLocked(addr, dc.clientConn)
+	}
+	dc.p.mu.Unlock()
 }
 
 func (p *clientConnPool) MarkDead(cc *ClientConn) {
