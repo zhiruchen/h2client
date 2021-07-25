@@ -51,3 +51,71 @@ type dataBuffer struct {
 	size     int   // total buffered bytes
 	expected int64 // expect at least expected Length bytes for write calls
 }
+
+func (b *dataBuffer) Read(p []byte) (int, error) {
+	if b.size == 0 {
+		return 0, fmt.Errorf("dataBuffer is empty")
+	}
+
+	var ntotal int
+	for len(p) > 0 && b.size > 0 {
+		readFrom := b.bytesFromFirstChunk()
+		n := copy(p, readFrom)
+		p = p[n:]
+
+		ntotal += n
+		b.r += n
+		b.size -= n
+
+		if b.r == len(b.chunks[0]) {
+			putDataBufferchunk(b.chunks[0])
+			end := len(b.chunks) - 1
+			copy(b.chunks[:end], b.chunks[1:])
+			b.chunks[end] = nil
+			b.chunks = b.chunks[:end]
+			b.r = 0
+		}
+	}
+	return ntotal, nil
+}
+
+func (b *dataBuffer) bytesFromFirstChunk() []byte {
+	if len(b.chunks) == 1 {
+		return b.chunks[0][b.r:b.w]
+	}
+
+	return b.chunks[0][b.r:]
+}
+
+func (b *dataBuffer) Write(p []byte) (int, error) {
+	ntotal := len(p)
+	for len(p) > 0 {
+		want := int64(len(p))
+		if b.expected > want {
+			want = b.expected
+		}
+
+		lastChunk := b.lastChunkOrAlloc(want)
+		n := copy(lastChunk[b.w:], p)
+		p = p[n:]
+		b.w += n
+		b.size += n
+		b.expected -= int64(n)
+	}
+
+	return ntotal, nil
+}
+
+func (b *dataBuffer) lastChunkOrAlloc(size int64) []byte {
+	if len(b.chunks) != 0 {
+		last := b.chunks[len(b.chunks)-1]
+		if b.w < len(last) {
+			return last
+		}
+	}
+
+	chunk := getDataBufferChunk(size)
+	b.chunks = append(b.chunks, chunk)
+	b.w = 0
+	return chunk
+}
