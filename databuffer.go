@@ -34,7 +34,7 @@ func getDataBufferChunk(size int64) []byte {
 	return dataChunkPools[i].Get().([]byte)
 }
 
-func putDataBufferchunk(p []byte) {
+func putDataBufferChunk(p []byte) {
 	for i, n := range dataChunkSizeClasses {
 		if len(p) == n {
 			dataChunkPools[i].Put(p)
@@ -68,7 +68,7 @@ func (b *dataBuffer) Read(p []byte) (int, error) {
 		b.size -= n
 
 		if b.r == len(b.chunks[0]) {
-			putDataBufferchunk(b.chunks[0])
+			putDataBufferChunk(b.chunks[0])
 			end := len(b.chunks) - 1
 			copy(b.chunks[:end], b.chunks[1:])
 			b.chunks[end] = nil
