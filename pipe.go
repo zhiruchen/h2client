@@ -60,7 +60,45 @@ func (p *pipe) Read(d []byte) (n int, err error) {
 	}
 }
 
-func (p *pipe) CloseWithErr(err error) {}
+func (p *pipe) CloseWithErr(err error) {
+	p.closeWithError(&p.err, err, nil)
+}
+
+func (p *pipe) closeWithError(dst *error, err error, readFn func()) {
+	if err == nil {
+		panic("err can not be nil")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.c.L == nil {
+		p.c.L = &p.mu
+	}
+	defer p.c.Signal()
+	if *dst != nil {
+		return
+	}
+
+	p.readFn = readFn
+	if dst == &p.breakErr {
+		p.b = nil
+	}
+	*dst = err
+	p.closeDoneLocked()
+}
+
+func (p *pipe) closeDoneLocked() {
+	if p.done == nil {
+		return
+	}
+
+	select {
+	case <-p.done:
+	default:
+		close(p.done)
+	}
+}
 
 func (p *pipe) Write(d []byte) (n int, err error) {
 	p.mu.Lock()
