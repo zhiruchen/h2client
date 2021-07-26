@@ -304,7 +304,7 @@ func (rl *connReadLoop) handleResponse(cs *clientStream, f *http2.MetaHeadersFra
 		return res, nil
 	}
 
-	cs.bufPipe = pipe{b: nil}
+	cs.bufPipe = pipe{b: &dataBuffer{expected: res.ContentLength}}
 	cs.bytesRemain = res.ContentLength
 	res.Body = resBody{cs: cs}
 

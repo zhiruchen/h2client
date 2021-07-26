@@ -52,6 +52,10 @@ type dataBuffer struct {
 	expected int64 // expect at least expected Length bytes for write calls
 }
 
+func (b *dataBuffer) Len() int {
+	return b.size
+}
+
 func (b *dataBuffer) Read(p []byte) (int, error) {
 	if b.size == 0 {
 		return 0, fmt.Errorf("dataBuffer is empty")
@@ -59,8 +63,8 @@ func (b *dataBuffer) Read(p []byte) (int, error) {
 
 	var ntotal int
 	for len(p) > 0 && b.size > 0 {
-		readFrom := b.bytesFromFirstChunk()
-		n := copy(p, readFrom)
+		first := b.bytesFromFirstChunk()
+		n := copy(p, first)
 		p = p[n:]
 
 		ntotal += n
