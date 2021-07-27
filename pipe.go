@@ -60,8 +60,18 @@ func (p *pipe) Read(d []byte) (n int, err error) {
 	}
 }
 
+// CloseWithErr cause the next read return the provided error, after all data has been read
 func (p *pipe) CloseWithErr(err error) {
 	p.closeWithError(&p.err, err, nil)
+}
+
+// BreakWithError cause the next read return the provided error immediately, without wait the unread data
+func (p *pipe) BreakWithError(err error) {
+	p.closeWithError(&p.breakErr, err, nil)
+}
+
+func (p *pipe) closeWithErrAndCode(err error, readFn func()) {
+	p.closeWithError(&p.err, err, readFn)
 }
 
 func (p *pipe) closeWithError(dst *error, err error, readFn func()) {
@@ -116,4 +126,27 @@ func (p *pipe) Write(d []byte) (n int, err error) {
 	}
 
 	return p.b.Write(d)
+}
+
+func (p *pipe) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.breakErr != nil {
+		return p.breakErr
+	}
+	return p.err
+}
+
+func (p *pipe) Done() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Lock()
+
+	if p.done == nil {
+		p.done = make(chan struct{})
+		if p.breakErr != nil || p.err != nil {
+			p.closeDoneLocked()
+		}
+	}
+	return p.done
 }
