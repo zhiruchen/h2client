@@ -43,9 +43,10 @@ type ClientConn struct {
 	idleTimeout time.Duration
 	idleTimer   *time.Timer
 
-	bw *bufio.Writer
-	br *bufio.Reader
-	fr *http2.Framer
+	bw         *bufio.Writer
+	br         *bufio.Reader
+	fr         *http2.Framer
+	lastActive time.Time
 
 	readDone  chan struct{} // close on error
 	readerErr error         // set after readDone is closed
@@ -568,4 +569,19 @@ func (cc *ClientConn) getStreamByID(id uint32) *clientStream {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return cc.streams[id]
+}
+
+func (cc *ClientConn) forgetStreamID(id uint32) {
+	cc.mu.Lock()
+	defer cc.mu.Lock()
+	cs := cc.getStreamByID(id)
+	if cs != nil && !cc.closed {
+		cc.lastActive = time.Now()
+		delete(cc.streams, id)
+		if len(cc.streams) == 0 && cc.idleTimer != nil {
+			cc.idleTimer.Reset(cc.idleTimeout)
+		}
+		close(cs.done)
+		cc.cond.Broadcast()
+	}
 }
