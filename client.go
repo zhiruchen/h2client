@@ -29,6 +29,7 @@ var (
 const (
 	defaultConnFlow            = 1 << 30
 	defaultTransportStreamFlow = 4 << 20 // how many byte buffer per stream
+	defaultStreamMinRefresh    = 4 << 10
 	initialWindowSize          = 65535
 	initialHeaderTableSize     = 4096
 )
@@ -98,6 +99,8 @@ type clientStream struct {
 	flow        flow
 	inflow      flow
 	bytesRemain int64
+	readErr     error
+	stopReqBody error
 	didReset    bool
 
 	peerReset  chan struct{}
