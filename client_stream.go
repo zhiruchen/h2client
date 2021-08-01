@@ -111,3 +111,22 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 	}
 	return err
 }
+
+func (cs *clientStream) abortRequestBodyWrite(err error) {
+	if err == nil {
+		panic("nil error")
+	}
+
+	cc := cs.cc
+	cc.mu.Lock()
+	cs.stopReqBody = err
+	cc.cond.Broadcast()
+	cc.mu.Unlock()
+}
+
+func (cs *clientStream) getStartedWrite() bool {
+	cc := cs.cc
+	cc.mu.Lock()
+	defer cc.mu.Lock()
+	return cs.startedWriteBody
+}

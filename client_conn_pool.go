@@ -11,7 +11,7 @@ import (
 
 // ClientConnPool Manage pool of HTTP/2 client connection
 type ClientConnPool interface {
-	GetClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error)
+	GetClientConn(req *http.Request, addr string) (*ClientConn, error)
 	MarkDead(*ClientConn)
 }
 
@@ -25,8 +25,8 @@ type clientConnPool struct {
 	addConnCalls map[string]*addConnCall // in-flight addConnIfNeed calls
 }
 
-func (p *clientConnPool) GetClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {
-	return p.getClientConn(req, addr, dialOnMiss)
+func (p *clientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
+	return p.getClientConn(req, addr, true)
 }
 
 func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {

@@ -107,6 +107,7 @@ type bodyWriterSate struct {
 	fn     func()
 	fnonce *sync.Once
 	timer  *time.Timer
+	delay  time.Duration
 }
 
 func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s bodyWriterSate) {
@@ -123,8 +124,8 @@ func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s body
 		cs.cc.mu.Unlock()
 		resc <- cs.writeRequestBody(body, cs.req.Body)
 	}
+	s.delay = t.expectContinueTimeout()
 
-	//todo: get s.delay
 	s.fnonce = new(sync.Once)
 	s.timer = time.AfterFunc(365*24*time.Hour, func() {
 		s.fnonce.Do(s.fn)
@@ -135,5 +136,16 @@ func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s body
 func (s bodyWriterSate) cancel() {
 	if s.timer != nil {
 		s.timer.Stop()
+	}
+}
+
+func (s bodyWriterSate) scheduleBodyWrite() {
+	if s.timer == nil {
+		go s.fn()
+		return
+	}
+
+	if s.timer.Stop() {
+		s.timer.Reset(s.delay)
 	}
 }

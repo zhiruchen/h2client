@@ -23,7 +23,10 @@ import (
 var (
 	clientPreface = []byte(http2.ClientPreface)
 
-	errClientConnGotGoAway = errors.New("[http2] transport received server's GoAway")
+	errClientConnGotGoAway       = errors.New("[http2] transport received server's GoAway")
+	errStopWriteReqBody          = errors.New("[http2] aborting request body write")
+	errStopWriteReqBodyAndCancel = errors.New("[http2] canceling request")
+	errTimeout                   = errors.New("[http2] timeout awaiting response header")
 )
 
 const (
@@ -139,6 +142,9 @@ type Transport struct {
 	// How many bytes of the response headers are allowed
 	MaxHeaderListSize uint32
 	t1                *http.Transport
+
+	connPoolOnce  sync.Once
+	connPoolOrDef ClientConnPool
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -154,7 +160,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	addr := authorityAddr(req.URL.Scheme, req.URL.Host)
-	cc, err := t.ConnPool.GetClientConn(req, addr)
+	cc, err := t.connPool().GetClientConn(req, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +181,19 @@ func authorityAddr(scheme string, authority string) (addr string) {
 	}
 
 	return net.JoinHostPort(host, port)
+}
+
+func (t *Transport) connPool() ClientConnPool {
+	t.connPoolOnce.Do(t.initConnPool)
+	return t.connPoolOrDef
+}
+
+func (t *Transport) initConnPool() {
+	if t.ConnPool != nil {
+		t.connPoolOrDef = t.ConnPool
+	} else {
+		t.connPoolOrDef = &clientConnPool{t: t}
+	}
 }
 
 func (t *Transport) dialClientConn(addr string, singleUse bool) (*ClientConn, error) {
@@ -315,6 +334,14 @@ func (t *Transport) newClientConn(conn net.Conn, singleUse bool) (*ClientConn, e
 	return cc, nil
 }
 
+func (t *Transport) expectContinueTimeout() time.Duration {
+	if t.t1 == nil {
+		return 0
+	}
+
+	return t.t1.ExpectContinueTimeout
+}
+
 func (cc *ClientConn) setGoAway(f *http2.GoAwayFrame) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -439,6 +466,82 @@ func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, bool, error)
 	}
 
 	//todo: handle read loop
+	var respHeaderTimer <-chan time.Time
+	if hasBody {
+		bodyWriter.scheduleBodyWrite()
+	} else {
+		if d := cc.responseHeaderTimeout(); d != 0 {
+			timer := time.NewTimer(d)
+			defer timer.Stop()
+			respHeaderTimer = timer.C
+		}
+	}
+
+	readLoopCh := cs.resc
+	bodyWritten := false
+	ctx := reqContext(req)
+
+	handleReadLoopResp := func(resp h2Resp) (*http.Response, bool, error) {
+		res := resp.res
+		if resp.err != nil || res.StatusCode > 299 {
+			bodyWriter.cancel()
+			cs.abortRequestBodyWrite(errStopWriteReqBody)
+		}
+
+		if resp.err != nil {
+			cc.forgetStreamID(cs.ID)
+			return nil, cs.getStartedWrite(), resp.err
+		}
+
+		res.Request = req
+		res.TLS = cc.tlsState
+		return res, false, nil
+	}
+
+	resetAndForgetStream := func(hasBody bool, bodyWritten bool) {
+		if !hasBody || bodyWritten {
+			cc.writeStreamReset(cs.ID, http2.ErrCodeCancel, nil)
+		} else {
+			bodyWriter.cancel()
+			cs.abortRequestBodyWrite(errStopWriteReqBodyAndCancel)
+		}
+		cc.forgetStreamID(cs.ID)
+	}
+
+	for {
+		select {
+		case re := <-readLoopCh:
+			return handleReadLoopResp(re)
+		case <-respHeaderTimer:
+			resetAndForgetStream(hasBody, bodyWritten)
+			return nil, cs.getStartedWrite(), errTimeout
+		case <-ctx.Done():
+			resetAndForgetStream(hasBody, bodyWritten)
+			return nil, cs.getStartedWrite(), ctx.Err()
+		case <-req.Cancel:
+			resetAndForgetStream(hasBody, bodyWritten)
+			return nil, cs.getStartedWrite(), errRequestCanceled
+		case <-cs.peerReset:
+			return nil, cs.getStartedWrite(), cs.resetError
+		case err := <-bodyWriter.resc:
+			select {
+			case re := <-readLoopCh:
+				return handleReadLoopResp(re)
+			default:
+			}
+
+			if err != nil {
+				return nil, cs.getStartedWrite(), err
+			}
+
+			bodyWritten = true
+			if d := cc.responseHeaderTimeout(); d != 0 {
+				timer := time.NewTimer(d)
+				defer timer.Stop()
+				respHeaderTimer = timer.C
+			}
+		}
+	}
 
 	res := <-cs.resc
 	return res.res, false, nil
@@ -609,4 +712,11 @@ func (cc *ClientConn) writeStreamReset(sID uint32, code http2.ErrCode, err error
 	cc.fr.WriteRSTStream(sID, code)
 	cc.bw.Flush()
 	cc.wmu.Unlock()
+}
+
+func (cc *ClientConn) responseHeaderTimeout() time.Duration {
+	if cc.t.t1 != nil {
+		return cc.t.t1.ResponseHeaderTimeout
+	}
+	return 0
 }
