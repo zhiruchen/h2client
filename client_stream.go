@@ -3,7 +3,10 @@ package h2client
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
+
+	"golang.org/x/net/http2"
 )
 
 var (
@@ -17,6 +20,7 @@ func (cs *clientStream) awaitRequestCancel(req *http.Request) {
 	}
 }
 
+// waits for the user to cancel a request
 func awaitRequestCancel(req *http.Request, done <-chan struct{}) error {
 	ctx := reqContext(req)
 	if req.Cancel == nil && ctx.Done() == nil {
@@ -45,6 +49,65 @@ func (cs *clientStream) cancelStream() {
 	cc.mu.Unlock()
 
 	if !didReset {
-		//todo: write stream reset, forgetStreamByID
+		cc.writeStreamReset(cs.ID, http2.ErrCodeCancel, nil)
+		cc.forgetStreamID(cs.ID)
 	}
+}
+
+func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (err error) {
+	cc := cs.cc
+	sentEnd := false
+	buf := make([]byte, cc.maxFrameSize)
+
+	defer func() {
+		cerr := bodyCloser.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
+
+	var bodyEOF bool
+	for !bodyEOF {
+		n, err := body.Read(buf)
+		if err != nil && err != io.EOF {
+			return err
+		}
+
+		if err == io.EOF {
+			bodyEOF = true
+			err = nil
+		}
+
+		remain := buf[:n]
+		for len(remain) > 0 && err == nil {
+			//todo: awaitFlowControl
+			allowed := cc.maxFrameSize
+
+			cc.wmu.Lock()
+			data := remain[:allowed]
+			remain = remain[allowed:]
+			sentEnd = bodyEOF && len(remain) == 0
+			err = cc.fr.WriteData(cs.ID, sentEnd, data)
+			if err != nil {
+				err = cc.bw.Flush()
+			}
+			cc.wmu.Unlock()
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	if sentEnd {
+		return nil
+	}
+
+	cc.wmu.Lock()
+	defer cc.wmu.Unlock()
+
+	err = cc.fr.WriteData(cs.ID, true, nil)
+	if ferr := cc.bw.Flush(); ferr != nil && err == nil {
+		err = ferr
+	}
+	return err
 }

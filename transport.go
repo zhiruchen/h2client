@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -98,4 +99,41 @@ func (t *Transport) idleConnTimeout() time.Duration {
 	}
 
 	return 0
+}
+
+type bodyWriterSate struct {
+	cs     *clientStream
+	resc   chan error
+	fn     func()
+	fnonce *sync.Once
+	timer  *time.Timer
+}
+
+func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s bodyWriterSate) {
+	s.cs = cs
+	if body == nil {
+		return
+	}
+
+	resc := make(chan error, 1)
+	s.resc = resc
+	s.fn = func() {
+		cs.cc.mu.Lock()
+		cs.startedWriteBody = true
+		cs.cc.mu.Unlock()
+		resc <- cs.writeRequestBody(body, cs.req.Body)
+	}
+
+	//todo: get s.delay
+	s.fnonce = new(sync.Once)
+	s.timer = time.AfterFunc(365*24*time.Hour, func() {
+		s.fnonce.Do(s.fn)
+	})
+	return
+}
+
+func (s bodyWriterSate) cancel() {
+	if s.timer != nil {
+		s.timer.Stop()
+	}
 }

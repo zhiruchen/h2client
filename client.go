@@ -94,9 +94,12 @@ type clientStream struct {
 	cc  *ClientConn
 	req *http.Request
 
-	ID          uint32
-	resc        chan h2Resp
-	bufPipe     pipe
+	ID               uint32
+	resc             chan h2Resp
+	bufPipe          pipe
+	startedWriteBody bool
+	requestedGzip    bool
+
 	flow        flow
 	inflow      flow
 	bytesRemain int64
@@ -107,10 +110,10 @@ type clientStream struct {
 	peerReset  chan struct{}
 	resetError error
 
-	done chan struct{}
+	done chan struct{} // closed when stream remove from cc.streams map, guard by cc.mu
 
-	pw *io.PipeWriter
-	pr *io.PipeReader
+	firstByte   bool // got the first response byte
+	pastHeaders bool // get the first MetaHeadersFrame
 }
 
 type stickyErrWriter struct {
@@ -396,34 +399,49 @@ func (cc *ClientConn) readLoop() {
 	}
 }
 
-func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
+func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, bool, error) {
 	return cc.roundTrip(req)
 }
 
-func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
+func (cc *ClientConn) roundTrip(req *http.Request) (*http.Response, bool, error) {
+	if cc.idleTimer != nil {
+		cc.idleTimer.Stop()
+	}
+
 	cc.mu.Lock()
-	// body := req.Body
 	contentLength := req.ContentLength
 	hasBody := contentLength != 0
 
 	hdrs, err := cc.encodeHeaders(req, contentLength)
 	if err != nil {
 		cc.mu.Unlock()
-		return nil, err
+		return nil, false, err
 	}
 
 	cs := cc.newStream()
 	cs.req = req
+
+	body := req.Body
+	bodyWriter := cc.t.getBodyWriterState(cs, body)
+
 	endStream := !hasBody
 	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
 	cc.mu.Unlock()
 
 	if werr != nil {
 		fmt.Printf("[roundTrip] writeHeaders error: %v\n", werr)
+		if hasBody {
+			req.Body.Close()
+			bodyWriter.cancel()
+		}
+		cc.forgetStreamID(cs.ID)
+		return nil, false, werr
 	}
 
+	//todo: handle read loop
+
 	res := <-cs.resc
-	return res.res, nil
+	return res.res, false, nil
 }
 
 func (cc *ClientConn) encodeHeaders(req *http.Request, contentLength int64) ([]byte, error) {
@@ -584,4 +602,11 @@ func (cc *ClientConn) forgetStreamID(id uint32) {
 		close(cs.done)
 		cc.cond.Broadcast()
 	}
+}
+
+func (cc *ClientConn) writeStreamReset(sID uint32, code http2.ErrCode, err error) {
+	cc.wmu.Lock()
+	cc.fr.WriteRSTStream(sID, code)
+	cc.bw.Flush()
+	cc.wmu.Unlock()
 }
