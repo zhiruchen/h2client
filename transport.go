@@ -93,6 +93,25 @@ func (b resBody) Close() error {
 	return nil
 }
 
+func (t *Transport) RoundTripOpt(req *http.Request, opt http2.RoundTripOpt) (*http.Response, error) {
+	if !(req.URL.Scheme == "https" || (req.URL.Scheme == "http" && t.AllowHTTP)) {
+		return nil, errors.New("[http2] unsuuprted scheme")
+	}
+
+	addr := authorityAddr(req.URL.Scheme, req.URL.Host)
+	cc, err := t.connPool().GetClientConn(req, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	res, _, err := cc.roundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
 func (t *Transport) idleConnTimeout() time.Duration {
 	if t.t1 != nil {
 		return t.t1.IdleConnTimeout

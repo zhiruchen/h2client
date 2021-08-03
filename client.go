@@ -138,6 +138,7 @@ type Transport struct {
 	DialTLS         func(network, addr string, cfg *tls.Config) (net.Conn, error)
 	TLSClientConfig *tls.Config
 	ConnPool        ClientConnPool
+	AllowHTTP       bool
 
 	// How many bytes of the response headers are allowed
 	MaxHeaderListSize uint32
